@@ -6,6 +6,7 @@ from typing import Optional, Literal, Any
 
 import backoff
 import dspy
+import groq.types.chat
 import requests
 from dsp import ERRORS, backoff_hdlr, giveup_hdlr
 from dsp.modules.hf import openai_to_hf
@@ -714,3 +715,108 @@ class GoogleModel(dspy.dsp.modules.lm.LM):
             completions.append(response.parts[0].text)
 
         return completions
+
+
+
+class GroqModel(dspy.dsp.modules.lm.LM):
+    """A wrapper class for GroqCloud API."""
+
+    def __init__(
+            self,
+            model: str,
+            api_key: Optional[str] = None,
+            **kwargs,
+    ):
+        """You can use `genai.list_models()` to get a list of available models."""
+        super().__init__(model)
+        try:
+            import groq
+        except ImportError as err:
+            raise ImportError("GroqModel requires `pip install groq`.") from err
+
+        api_key = os.environ.get("GROQ_API_KEY") if api_key is None else api_key
+        self.client = groq.Groq(api_key=api_key)
+
+        self.model = model
+        self.kwargs = {
+            "n": 1,
+            **kwargs,
+        }
+
+        self.history: list[dict[str, Any]] = []
+
+        self._token_usage_lock = threading.Lock()
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+    def log_usage(self, response: groq.types.chat.ChatCompletion):
+        """Log the total tokens from the Google API response."""
+        usage_data = response.usage
+        if usage_data:
+            with self._token_usage_lock:
+                self.prompt_tokens += usage_data.prompt_tokens
+                self.completion_tokens += usage_data.completion_tokens
+
+    def get_usage_and_reset(self):
+        """Get the total tokens used and reset the token usage."""
+        usage = {
+            self.model:
+                {'prompt_tokens': self.prompt_tokens, 'completion_tokens': self.completion_tokens}
+        }
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+
+        return usage
+
+    def basic_request(self, prompt: str, **kwargs):
+        raw_kwargs = kwargs
+        kwargs = {
+            **self.kwargs,
+            **kwargs,
+        }
+
+
+        response = self.client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            **kwargs,
+        )
+        history = {
+            "prompt": prompt,
+            "response": [response.to_dict()],
+            "kwargs": kwargs,
+            "raw_kwargs": raw_kwargs,
+        }
+        self.history.append(history)
+
+        return response
+
+    @backoff.on_exception(
+        backoff.expo,
+        (Exception,),
+        max_time=1000,
+        max_tries=8,
+        on_backoff=backoff_hdlr,
+        giveup=giveup_hdlr,
+    )
+    def request(self, prompt: str, **kwargs):
+        """Handles retrieval of completions from Groq whilst handling API errors"""
+        return self.basic_request(prompt, **kwargs)
+
+
+
+    def __call__(
+            self,
+            prompt: str,
+            only_completed: bool = True,
+            return_sorted: bool = False,
+            **kwargs,
+    ):
+        assert only_completed, "for now"
+        assert return_sorted is False, "for now"
+
+        n = kwargs.pop("n", 1)
+
+        response = self.request(prompt, **kwargs)
+        self.log_usage(response)
+
+        return [item.message.content for item in response.choices]
